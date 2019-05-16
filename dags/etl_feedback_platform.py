@@ -4,20 +4,21 @@ from airflow.models import DAG, Variable
 from airflow.utils.dates import days_ago
 from airflow.contrib.hooks.bigquery_hook import BigQueryHook
 from airflow.contrib.operators.bigquery_operator import BigQueryOperator
+from airflow.operators.python_operator import PythonOperator, BranchPythonOperator
 from airflow.operators.dummy_operator import DummyOperator
 from airflow.contrib.operators.bigquery_check_operator import BigQueryCheckOperator
 import json
 
 from helpers import set_max_active_runs
 
-DAG_CONF = Variable.get('platform_dconf_mobile_web', deserialize_json=True)
+DAG_CONF = Variable.get('dconf_mobile_web_platform', deserialize_json=True)
 
 DAG_OBJ = DAG(
-    dag_id='etl_feedback_mobile_web',
+    dag_id='etl_feedback_platform',
     description='ETL feedback data from mobile and web',
     default_args={
         'owner': DAG_CONF['owner'],
-        'start_date': datetime(2017, 2, 3),
+        'start_date': datetime(2017, 3, 2),
         'email': DAG_CONF['emails'],
         'email_on_failure': True,
         'email_on_retry': False,
@@ -27,73 +28,91 @@ DAG_OBJ = DAG(
     max_active_runs=set_max_active_runs(),
     schedule_interval='@daily')
 
-def bq_check_mobile(**kwargs):
-    hook = BigQueryHook(bigquery_conn_id=DAG_CONF['bigquery_conn_id'])
-    table_exists = hook.table_exists(
-        project_id=DAG_CONF['project'],
-        dataset_id=DAG_CONF['dataset_mobile'],
-        table_id=DAG_CONF['table_mobile'])
-    if table_exists:
-        return 'Bigquery_load_mobile_data'
+def bq_check_mobile_func(ds,**kwargs):
+    hook = BigQueryHook(bigquery_conn_id=DAG_CONF['bigquery_conn_id'],use_legacy_sql=False)
+    
+    sql = ("SELECT COUNT(1) AS total"
+          " FROM `{project}.{dataset}.{table}`"
+          " WHERE DATE(_PARTITIONTIME) = '{partition}' and Review_Text is not null").format(
+            project = DAG_CONF['project'],
+            dataset = DAG_CONF['dataset_mobile'],
+            table = DAG_CONF['table_mobile'],
+            partition = ds)
+    print(sql)
+    records = hook.get_records(sql)[0][0]
+    if records:
+        return 'bigquery_load_mobile_data'
     else:
         return 'bigquery_website_check_data'
 
-def bq_check_website(**kwargs):
-    hook = BigQueryHook(bigquery_conn_id=DAG_CONF['bigquery_conn_id'])
-    table_exists = hook.table_exists(
-        project_id=DAG_CONF['project'],
-        dataset_id=DAG_CONF['dataset_website'],
-        table_id=DAG_CONF['table_website'])
-    if table_exists:
-        return 'Bigquery_load_website_data'
+def bq_check_website_func(ds,**kwargs):
+    hook = BigQueryHook(bigquery_conn_id=DAG_CONF['bigquery_conn_id'],use_legacy_sql=False)
+    sql = ("SELECT COUNT(1) AS total"
+          " FROM `{project}.{dataset}.{table}`"
+          " WHERE DATE(_PARTITIONTIME) = '{partition}' and description is not null").format(
+            project = DAG_CONF['project'],
+            dataset = DAG_CONF['dataset_website'],
+            table = DAG_CONF['table_website'],
+            partition = ds)
+    records = hook.get_records(sql)[0][0]
+    if records:
+        return 'bigquery_load_website_data'
     else:
         return 'no_data'
 
-def verify_records_func_mobile(ds, **kwargs):
-    mobile_record = kwargs['ti'].xcom_pull(task_ids='Bigquery_mobile_record')
-    platform_mobile_record = kwargs['ti'].xcom_pull(task_ids='Bigquery_mobile_platform_record')
+def verify_records_mobile_func(ds, **kwargs):
+    mobile_record = kwargs['ti'].xcom_pull(task_ids='bigquery_mobile_record')
+    platform_mobile_record = kwargs['ti'].xcom_pull(task_ids='bigquery_mobile_platform_record')
     return mobile_record == platform_mobile_record
 
-def verify_records_func_website(ds, **kwargs):
-    website_record = kwargs['ti'].xcom_pull(task_ids='Bigquery_website_record')
-    platform_website_record = kwargs['ti'].xcom_pull(task_ids='Bigquery_website_platform_record')
+def verify_records_website_func(ds, **kwargs):
+    website_record = kwargs['ti'].xcom_pull(task_ids='bigquery_website_record')
+    platform_website_record = kwargs['ti'].xcom_pull(task_ids='bigquery_website_platform_record')
     return website_record == platform_website_record
 
 #-------------------------------------------------------------------------------
 
 bigquery_mobile_check_data = BranchPythonOperator(
     task_id='bigquery_mobile_check_data',
-    python_callable=bq_check_mobile,
+    python_callable=bq_check_mobile_func,
     provide_context=True,
     dag=DAG_OBJ)
 
-bigquery_website_check_data = BranchPythonOperator(
-    task_id='bigquery_website_check_data',
-    python_callable=bq_check_website,
+bigquery_website_check_data_first = BranchPythonOperator(
+    task_id='bigquery_website_check_data_first',
+    python_callable=bq_check_website_func,
     provide_context=True,
+    trigger_rule='one_success',
+    dag=DAG_OBJ)
+
+bigquery_website_check_data_second = BranchPythonOperator(
+    task_id='bigquery_website_check_data_second',
+    python_callable=bq_check_website_func,
+    provide_context=True,
+    trigger_rule='one_success',
     dag=DAG_OBJ)
 
 verify_record_mobile = PythonOperator(
     task_id='verify_record_mobile',
-    python_callable=verify_records_func_mobile,
+    python_callable=verify_records_mobile_func,
     provide_context=True,
     dag=DAG_OBJ)
 
 verify_record_website = PythonOperator(
     task_id='verify_record_website',
-    python_callable=verify_records_func_website,
+    python_callable=verify_records_website_func,
     provide_context=True,
     dag=DAG_OBJ)
 
 #-------------------------------------------------------------------------------
 
 sql = """
-SELECT COUNT(1) AS total
-FROM `{{ params.project }}.{{ params.dataset }}.{{ params.table }}`
-WHERE DATE(_PARTITIONTIME) = '{{ ds }}' AND resource = '{{ params.source_table}}'
-"""
-Bigquery_website_platform_record = BigQueryCheckOperator(
-    task_id='Bigquery_website_platform_record',
+  SELECT COUNT(1) AS total
+  FROM `{{ params.project }}.{{ params.dataset }}.{{ params.table }}`
+  WHERE DATE(_PARTITIONTIME) = '{{ ds }}' AND resource = 'website'
+  """
+bigquery_website_platform_record = BigQueryCheckOperator(
+    task_id='bigquery_website_platform_record',
     bigquery_conn_id=DAG_CONF['bigquery_conn_id'],
     sql=sql,
     use_legacy_sql=False,
@@ -106,12 +125,12 @@ Bigquery_website_platform_record = BigQueryCheckOperator(
     dag=DAG_OBJ)
 
 sql = """
-SELECT COUNT(1) AS total
-FROM `{{ params.project }}.{{ params.dataset }}.{{ params.table }}`
-WHERE DATE(_PARTITIONTIME) = '{{ ds }}'
-"""
-Bigquery_website_record = BigQueryCheckOperator(
-    task_id='Bigquery_website_record',
+  SELECT COUNT(1) AS total
+  FROM `{{ params.project }}.{{ params.dataset }}.{{ params.table }}`
+  WHERE DATE(_PARTITIONTIME) = '{{ ds }}' and description is not null
+  """
+bigquery_website_record = BigQueryCheckOperator(
+    task_id='bigquery_website_record',
     bigquery_conn_id=DAG_CONF['bigquery_conn_id'],
     sql=sql,
     use_legacy_sql=False,
@@ -123,12 +142,12 @@ Bigquery_website_record = BigQueryCheckOperator(
     dag=DAG_OBJ)
 
 sql = """
-SELECT COUNT(1) AS total
-FROM `{{ params.project }}.{{ params.dataset }}.{{ params.table }}`
-WHERE DATE(_PARTITIONTIME) = '{{ ds }}' AND resource = '{{ params.source_table}}'
-"""
-Bigquery_mobile_platform_record = BigQueryCheckOperator(
-    task_id='Bigquery_mobile_platform_record',
+  SELECT COUNT(1) AS total
+  FROM `{{ params.project }}.{{ params.dataset }}.{{ params.table }}`
+  WHERE DATE(_PARTITIONTIME) = '{{ ds }}' AND resource = 'mobile'
+  """
+bigquery_mobile_platform_record = BigQueryCheckOperator(
+    task_id='bigquery_mobile_platform_record',
     bigquery_conn_id=DAG_CONF['bigquery_conn_id'],
     sql=sql,
     use_legacy_sql=False,
@@ -141,12 +160,12 @@ Bigquery_mobile_platform_record = BigQueryCheckOperator(
     dag=DAG_OBJ)
 
 sql = """
-SELECT COUNT(1) AS total
-FROM `{{ params.project }}.{{ params.dataset }}.{{ params.table }}`
-WHERE DATE(_PARTITIONTIME) = '{{ ds }}'
-"""
-Bigquery_mobile_record = BigQueryCheckOperator(
-    task_id='Bigquery_mobile_record',
+  SELECT COUNT(1) AS total
+  FROM `{{ params.project }}.{{ params.dataset }}.{{ params.table }}`
+  WHERE DATE(_PARTITIONTIME) = '{{ ds }}' and Review_Text is not null
+  """
+bigquery_mobile_record = BigQueryCheckOperator(
+    task_id='bigquery_mobile_record',
     bigquery_conn_id=DAG_CONF['bigquery_conn_id'],
     sql=sql,
     use_legacy_sql=False,
@@ -160,30 +179,23 @@ Bigquery_mobile_record = BigQueryCheckOperator(
 #-------------------------------------------------------------------------------
 
 sql = """
-WITH
-  mobile_ds AS (
-  SELECT
-    Review_Text AS description,
-    DATE(Review_Submit_Date_and_Time) AS created_at,
-    'mobile' AS resource
-  FROM
-    `{{ params.project }}.{{ params.dataset }}.{{ params.table }}`
-  WHERE
-    DATE(Review_Submit_Date_and_Time) = '{{ ds }}')
-SELECT
-  *
-FROM
-  mobile_ds
-WHERE
-  mobile_ds.description IS NOT NULL
-"""
-Bigquery_load_mobile_data = BigQueryOperator(
-    task_id='Bigquery_load_mobile_data',
+    SELECT
+      Review_Text AS description,
+      DATE(Review_Submit_Date_and_Time) AS created_at,
+      'mobile' AS resource
+    FROM
+      `{{ params.project }}.{{ params.dataset }}.{{ params.table }}`
+    WHERE
+      DATE(_PARTITIONTIME) = '{{ ds }}' and Review_Text is not null
+  """
+bigquery_load_mobile_data = BigQueryOperator(
+    task_id='bigquery_load_mobile_data',
     sql=sql,
     use_legacy_sql=False,
     write_disposition='WRITE_TRUNCATE',
     allow_large_results=True,
     destination_dataset_table='{{ params.project }}:{{ params.dataset_transform }}.{{ params.table_transform }}${{ ds_nodash }}',
+    schema_update_options=('ALLOW_FIELD_ADDITION', 'ALLOW_FIELD_RELAXATION'),
     params={
         'project': DAG_CONF['project'],
         'dataset':DAG_CONF['dataset_mobile'],
@@ -191,62 +203,21 @@ Bigquery_load_mobile_data = BigQueryOperator(
         'dataset_transform': DAG_CONF['dataset_transform'],
         'table_transform': DAG_CONF['table_transform'],
     },
-    dag=dag)
+    trigger_rule='one_success',
+    dag=DAG_OBJ)
 
 sql = """
-WITH
-  mobile_ds AS (
   SELECT
-    Review_Text AS description,
-    DATE(Review_Submit_Date_and_Time) AS created_at,
-    'mobile' AS resource
-  FROM
-    `{{ params.project }}.{{ params.dataset }}.{{ params.table }}`
-  WHERE
-    DATE(Review_Submit_Date_and_Time) = '{{ ds }}')
-SELECT
-  *
-FROM
-  mobile_ds
-WHERE
-  mobile_ds.description IS NOT NULL
+      description AS description,
+      DATE(created_at) AS created_at,
+      'website' AS resource
+    FROM
+      `{{ params.project }}.{{ params.dataset }}.{{ params.table }}`
+    WHERE
+      DATE(_PARTITIONTIME) = '{{ ds }}' and description is not null
 """
-Bigquery_load_mobile_data = BigQueryOperator(
-    task_id='Bigquery_load_mobile_data',
-    sql=sql,
-    use_legacy_sql=False,
-    write_disposition='WRITE_TRUNCATE',
-    allow_large_results=True,
-    destination_dataset_table='{{ params.project }}:{{ params.dataset_transform }}.{{ params.table_transform }}${{ ds_nodash }}',
-    params={
-        'project': DAG_CONF['project'],
-        'dataset':DAG_CONF['dataset_mobile'],
-        'table': DAG_CONF['table_mobile'],
-        'dataset_transform': DAG_CONF['dataset_transform'],
-        'table_transform': DAG_CONF['table_transform'],
-    },
-    dag=dag)
-
-sql = """
-WITH
-  website_ds AS (
-  SELECT
-    description AS description,
-    DATE(created_at) AS created_at,
-    'website' AS resource
-  FROM
-    `{{ params.project }}.{{ params.dataset }}.{{ params.table }}`
-  WHERE
-    DATE(_PARTITIONTIME) = '{{ ds }}')
-SELECT
-  *
-FROM
-  website_ds
-WHERE
-  website_ds.description IS NOT NULL
-"""
-Bigquery_load_website_data = BigQueryOperator(
-    task_id='Bigquery_load_website_data',
+bigquery_load_website_data = BigQueryOperator(
+    task_id='bigquery_load_website_data',
     sql=sql,
     use_legacy_sql=False,
     write_disposition='WRITE_TRUNCATE',
@@ -259,7 +230,8 @@ Bigquery_load_website_data = BigQueryOperator(
         'dataset_transform': DAG_CONF['dataset_transform'],
         'table_transform': DAG_CONF['table_transform'],
     },
-    dag=dag)
+    trigger_rule='one_success',
+    dag=DAG_OBJ)
 
 #-----------------------------------------------------------------------
 
@@ -273,14 +245,12 @@ all_task_completed = DummyOperator(
     trigger_rule='one_success',
     dag=DAG_OBJ)
 
-bigquery_mobile_check_data >> bigquery_website_check_data >> Bigquery_load_website_data >> Bigquery_website_record >> Bigquery_website_platform_record >> verify_record_website >> all_task_completed
-bigquery_mobile_check_data >> bigquery_website_check_data >> no_data >> all_task_completed
-bigquery_mobile_check_data >> Bigquery_load_mobile_data >> Bigquery_mobile_record >> Bigquery_mobile_platform_record >> verify_record_mobile >> 
-                                    bigquery_website_check_data >> Bigquery_load_website_data >> Bigquery_website_record >> Bigquery_website_platform_record >> verify_record_website >> all_task_completed
-bigquery_website_check_data >> no_data >> all_task_completed
+bigquery_mobile_check_data >> [bigquery_load_mobile_data, bigquery_website_check_data_first]
+bigquery_load_mobile_data >> bigquery_mobile_record >> bigquery_mobile_platform_record >> verify_record_mobile >> bigquery_website_check_data_second
 
-bigquery_mobile_check_data >> [Bigquery_load_mobile_data,bigquery_website_check_data]
-bigquery_website_check_data >> [no_data,Bigquery_load_website_data]
-Bigquery_load_website_data >> Bigquery_website_record >> Bigquery_website_platform_record >> verify_record_website >> all_task_completed
-Bigquery_load_mobile_data >> Bigquery_mobile_record >> Bigquery_mobile_platform_record >> verify_record_mobile >> bigquery_website_check_data >> [no_data,Bigquery_load_website_data]
-Bigquery_load_website_data >> Bigquery_website_record >> Bigquery_website_platform_record >> verify_record_website >> all_task_completed
+bigquery_website_check_data_first >> [bigquery_load_website_data, no_data]
+bigquery_website_check_data_second >> [bigquery_load_website_data, no_data]
+
+bigquery_load_website_data >> bigquery_website_record >> bigquery_website_platform_record >> verify_record_website
+
+all_task_completed << [no_data, verify_record_website]
